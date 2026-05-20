@@ -1,0 +1,128 @@
+function doGet(e) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var type = e.parameter.type || "ContNhap";
+  var sheet = ss.getSheetByName(type);
+
+  if (!sheet) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ error: "Không tìm thấy Sheet: " + type }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var data = sheet.getDataRange().getValues();
+  if (data.length <= 1) {
+    return ContentService.createTextOutput(JSON.stringify([])).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var headers = data[0];
+  var rows = [];
+
+  for (var i = 1; i < data.length; i++) {
+    if (data[i].some(cell => cell !== "")) {
+      var obj = {};
+      for (var j = 0; j < headers.length; j++) {
+        if (data[i][j] instanceof Date) {
+          obj[headers[j]] = data[i][j].toISOString();
+        } else {
+          obj[headers[j]] = data[i][j];
+        }
+      }
+      obj.rowIndex = i + 1; // Lưu lại vị trí dòng vật lý
+      rows.push(obj);
+    }
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify(rows))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var payload = JSON.parse(e.postData.contents);
+    
+    var sheetGiamDinh = ss.getSheetByName("GiamDinh");
+    var sheetLichSu = ss.getSheetByName("LichSu");
+    
+    var tz = "GMT+7";
+    var nowStr = Utilities.formatDate(new Date(), tz, "dd/MM/yyyy HH:mm:ss");
+
+    // ================= CHỨC NĂNG 1: THÊM MỚI GIÁM ĐỊNH =================
+    if (payload.action === "addGiamDinh") {
+      if (!sheetGiamDinh) throw new Error("Không tìm thấy Sheet GiamDinh");
+      var lastRow = sheetGiamDinh.getLastRow();
+      
+      // Tính số thứ tự tự động tăng tiến
+      payload.data[0] = lastRow === 1 ? 1 : Number(sheetGiamDinh.getRange(lastRow, 1).getValue()) + 1;
+      sheetGiamDinh.appendRow(payload.data);
+      
+      // Ghi Lịch sử
+      if (sheetLichSu) {
+        var lastRowHist = sheetLichSu.getLastRow();
+        var sttHist = lastRowHist === 1 ? 1 : Number(sheetLichSu.getRange(lastRowHist, 1).getValue()) + 1;
+        sheetLichSu.appendRow([sttHist, payload.data[1], "Khởi tạo phiếu: " + payload.data[3], payload.data[4] || "Hệ thống", nowStr]);
+      }
+
+      return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
+    } 
+    
+    // ================= CHỨC NĂNG 2: CẬP NHẬT / LƯU LẠI GIÁM ĐỊNH (ĐÃ ĐƯỢC FIX CỘT) =================
+    else if (payload.action === "updateGiamDinh") {
+      if (!sheetGiamDinh) throw new Error("Không tìm thấy Sheet GiamDinh");
+      if (!payload.rowIndex) throw new Error("Thiếu vị trí dòng (rowIndex) để cập nhật!");
+      
+      var rowIndex = Number(payload.rowIndex);
+      
+      // Đọc toàn bộ tiêu đề (Headers) hiện tại của sheet GiamDinh để dò cột linh hoạt
+      var headers = sheetGiamDinh.getRange(1, 1, 1, sheetGiamDinh.getLastColumn()).getValues()[0];
+      
+      // Dữ liệu chỉnh sửa gửi từ Frontend lên có thể là Object chứa các thuộc tính thay đổi
+      var editData = payload.data; 
+      
+      // Nếu dữ liệu gửi lên là dạng Object (Ví dụ: { "Trạng thái": "A", "Tình trạng": "OK" })
+      if (typeof editData === 'object' && !Array.isArray(editData)) {
+        // Chạy qua từng tiêu đề cột, nếu dữ liệu frontend gửi lên có trường đó thì cập nhật trực tiếp vào ô tương ứng
+        for (var k = 0; k < headers.length; k++) {
+          var headerName = headers[k];
+          if (editData[headerName] !== undefined) {
+            sheetGiamDinh.getRange(rowIndex, k + 1).setValue(editData[headerName]);
+          }
+        }
+        
+        // Lấy thông tin mã cont và người thực hiện để ghi log lịch sử
+        var contNo = editData["Mã container"] || editData["Số Container"] || sheetGiamDinh.getRange(rowIndex, 2).getValue();
+        var nguoiThucHien = editData["Người giám định"] || editData["Người cập nhật"] || "Kỹ thuật";
+        
+        // Ghi Log cập nhật vào bảng lịch sử
+        if (sheetLichSu) {
+          var lastRowHist = sheetLichSu.getLastRow();
+          var sttHist = lastRowHist === 1 ? 1 : Number(sheetLichSu.getRange(lastRowHist, 1).getValue()) + 1;
+          sheetLichSu.appendRow([sttHist, contNo, "Cập nhật tình trạng & sửa chữa", nguoiThucHien, nowStr]);
+        }
+      } 
+      // Phương án dự phòng nếu Frontend vẫn gửi dạng Mảng [] như cũ
+      else if (Array.isArray(editData)) {
+        payload.data[0] = sheetGiamDinh.getRange(rowIndex, 1).getValue(); // Giữ nguyên STT ô đầu tiên
+        var range = sheetGiamDinh.getRange(rowIndex, 1, 1, editData.length);
+        range.setValues([editData]);
+        
+        if (sheetLichSu) {
+          var lastRowHist = sheetLichSu.getLastRow();
+          var sttHist = lastRowHist === 1 ? 1 : Number(sheetLichSu.getRange(lastRowHist, 1).getValue()) + 1;
+          sheetLichSu.appendRow([sttHist, editData[1], "Cập nhật sửa đổi dòng: " + rowIndex, editData[4] || "Kỹ thuật", nowStr]);
+        }
+      }
+
+      return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ success: false, message: "Hành động (Action) không hợp lệ" })).setMimeType(ContentService.MimeType.JSON);
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ success: false, error: error.toString() })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
